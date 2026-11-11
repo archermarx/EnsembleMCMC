@@ -3,6 +3,7 @@ using Test
 using Distributions
 using LinearAlgebra
 using Printf
+using CairoMakie: Makie as mk
 
 @testset "Log-pdf evaluation" begin
 	priors = [Normal(0,1), Normal(0,1)]
@@ -94,8 +95,8 @@ end
 
 @testset "Linear regression" begin
 	N = 100
-	m = -0.75
-	b = 0.3
+	m = 1.25
+	b = -0.4
 	ξ = 0.1
 
 	x = sort(rand(N))
@@ -111,14 +112,14 @@ end
 	priors = [Uniform(-2, 2), Uniform(-2, 2)]
 
 	settings = EnsembleMCMC.DifferentialEvolutionSettings(;
-		chains_per_ensemble = 10,
+		chains_per_ensemble = 20,
 		target_acceptance_prob = 0.25,
 		stretch_parameter = 0.5
 	)
 
 	state = EnsembleMCMC.initialize_sampler(settings, log_likelihood, priors)
 
-	num_samples = 1000
+	num_samples = 500
 	for _ in 1:num_samples
 		EnsembleMCMC.step!(state, settings)
 	end
@@ -167,6 +168,9 @@ end
 	m_mean = mean(ms)
 	b_mean = mean(bs)
 
+	@test m_lo <= m <= m_hi
+	@test b_lo <= b <= b_hi
+
 	println(line * "\n  Slope\n" * line)
 	@printf(
 		"Truth: %.3f\nBest: %.3f\nMedian: %.3f\nMean: %.3f\n95%% CI: [%.3f, %.3f]\n",
@@ -178,10 +182,29 @@ end
 		b, b_best, b_med, b_mean, b_lo, b_hi
 	)
 	println(line)
-	
+
+	plot = true
+
+	if plot
+		fig = mk.Figure()
+		ax = mk.Axis(fig[1,1])
+		mk.scatter!(x, y, alpha=1.0)
+
+		M = 100
+		lines = zeros(N, M)
+		for i in 1:M
+			sample = rand(samples)
+			lines[:, i] = f(x, sample)
+		end
+
+		qs = [quantile(lines[i, :], [0.025, 0.975]) for i in 1:N]
+		q_lo = [_q[1] for _q in qs]
+		q_hi = [_q[2] for _q in qs]
+
+		mk.lines!(x, f(x, (m_best, b_best)), color=:black)
+		mk.lines!(x, q_lo, color=:black, linestyle=:dash)
+		mk.lines!(x, q_hi, color=:black, linestyle=:dash)
+		mk.save("samples_linear.png", fig, dpi=200)
+	end
+
 end
-
-	
-
-
-
