@@ -1,11 +1,14 @@
 module EnsembleMCMC
 
 using Distributions: logpdf
+using Random: shuffle!
+using Statistics: mean, quantile
 
 @kwdef struct DifferentialEvolutionSettings
 	chains_per_ensemble::Int
 	target_acceptance_prob::Float64
 	stretch_parameter::Float64
+	prior_jump_scale::Float64 = 0.0 # Scale of the difference of two independent prior draws.
 end
 
 struct Chain
@@ -19,8 +22,12 @@ struct Ensemble
 end
 
 struct SamplerCache
+	chain_cache::Vector{Chain}
+	ensembles::Tuple{Vector{Chain}, Vector{Chain}}
 	proposals::Matrix{Float64}
 	proposal_logpdfs::Vector{Float64}
+	outlier_mask::Vector{Bool}
+	mean_logpdfs::Vector{Float64}
 end
 
 mutable struct DifferentialEvolutionState{F, D}
@@ -28,7 +35,7 @@ mutable struct DifferentialEvolutionState{F, D}
 	prior_dists::D
 	γ0::Float64
 	accept_frac::Float64
-	ensembles::Tuple{Ensemble, Ensemble}
+	chains::Vector{Chain}
 	cache::SamplerCache
 end
 
@@ -92,11 +99,11 @@ function sample_distributions(dists, num_samples)
 	return collect(transpose(out))
 end
 
-function initialize_ensembles(settings::DifferentialEvolutionSettings, args...; kwargs...)
-	return initialize_ensembles(settings.chains_per_ensemble, args...; kwargs...)
+function initialize_ensemble(settings::DifferentialEvolutionSettings, args...; kwargs...)
+	return initialize_ensemble(settings.chains_per_ensemble, args...; kwargs...)
 end
 
-function initialize_ensembles(
+function initialize_ensemble(
 	chains_per_ensemble,
 	log_likelihood,
 	prior_dists;
@@ -122,9 +129,13 @@ function initialize_ensembles(
 		Chain([samples[:, i]], [logpdfs[i]], [true]) for i in eachindex(logpdfs)
 	]
 
-	ensemble_1 = Ensemble(chains[1:chains_per_ensemble])
-	ensemble_2 = Ensemble(chains[chains_per_ensemble+1:end])
-	return ensemble_1, ensemble_2
+	ensemble_1 = chains[1:chains_per_ensemble]
+	ensemble_2 = chains[chains_per_ensemble+1:end]
+	return chains, (ensemble_1, ensemble_2)
+end
+
+function calc_γ0(d)
+	return 2.38 / sqrt(2 * d)
 end
 
 function initialize_sampler(
@@ -134,54 +145,70 @@ function initialize_sampler(
 	initial_sample=nothing,
 	initial_sample_spread=0.1
 )
+	if !isfinite(settings.prior_jump_scale) || settings.prior_jump_scale < 0
+		throw(ArgumentError("prior_jump_scale must be finite and nonnegative"))
+	end
+
 	# Initialize ensembles, sampling from the prior distributions
-	γ0 = 2.38 / sqrt(2 * length(prior_dists))
-	ensembles = initialize_ensembles(settings.chains_per_ensemble, log_likelihood, prior_dists; initial_sample, initial_sample_spread)
+	chains, ensembles = initialize_ensemble(settings.chains_per_ensemble, log_likelihood, prior_dists; initial_sample, initial_sample_spread)
 
 	# Prepare sampler state and caches
-	d, n = length(prior_dists), 2 * settings.chains_per_ensemble
-	cache = SamplerCache(zeros(d, n), zeros(n))
-	state = DifferentialEvolutionState(log_likelihood, prior_dists, γ0, 1.0, ensembles, cache)
+	d, n = length(prior_dists), settings.chains_per_ensemble
+	cache = SamplerCache(copy(chains), ensembles, zeros(d, n), zeros(n), zeros(Bool, 2*n), zeros(2 * n))
+	state = DifferentialEvolutionState(log_likelihood, prior_dists, calc_γ0(d), 1.0, chains, cache)
 	return state
 end
 
-function calc_acceptance_fraction(ensembles::Tuple{Ensemble, Ensemble})
+function calc_acceptance_fraction(chains::Vector{Chain})
 	n_accept = 0
 	n_total = 0
 
-	for ensemble in ensembles
-		for chain in ensemble.chains
-			for accept in chain.accepted
-				n_accept += accept
-				n_total += 1
-			end
+	for chain in chains
+		for accept in chain.accepted
+			n_accept += accept
+			n_total += 1
 		end
 	end
 
 	return n_accept / n_total
 end
 
-"""For a global index [1, 2*chains_per_ensemble], returns ensemble index [1,2] and chain index [1,chains_per_ensemble]"""
-global_to_ensemble_index(global_index, chains_per_ensemble) = fldmod1(global_index, chains_per_ensemble)
+function clear_history!(state)
+	for chain in state.chains
+		chain.samples[1] = chain.samples[end]
+		chain.logpdfs[1] = chain.logpdfs[end]
+		chain.accepted[1] = true
 
-function ensemble_to_global_index((ensemble_index, chain_index), chains_per_ensemble)
-	return (ensemble_index - 1) * chains_per_ensemble + chain_index
+		# We do a resize-in-place to avoid invalidating pointers
+		resize!(chain.samples, 1)
+		resize!(chain.logpdfs, 1)
+		resize!(chain.accepted, 1)
+	end
+	return state
 end
 
-function step!(state::DifferentialEvolutionState, settings::DifferentialEvolutionSettings)
-	(;proposals, proposal_logpdfs) = state.cache
-	(;chains_per_ensemble, stretch_parameter) = settings
+"""
+    step!(state, settings; move_outliers=false)
 
+Advance all chains once. Optionally replace low-density outliers with copies of
+random surviving walkers, using the most recent half of the recorded proposals.
+Relocations are not counted as accepted Metropolis proposals. Enable relocation
+only for samples the caller intends to discard.
+"""
+function step!(state::DifferentialEvolutionState, settings::DifferentialEvolutionSettings; move_outliers::Bool=false)
+	(;outlier_mask, chain_cache, ensembles, proposals, proposal_logpdfs) = state.cache
+	(;chains_per_ensemble, stretch_parameter, prior_jump_scale) = settings
+
+	# Reshuffle whole chains between halves, preserving their histories.
+	copyto!(chain_cache, state.chains)
+	shuffle!(chain_cache)
+	copyto!(ensembles[1], 1, chain_cache, 1, chains_per_ensemble)
+	copyto!(ensembles[2], 1, chain_cache, chains_per_ensemble + 1, chains_per_ensemble)
+
+	# Update each half holding the other half fixed.
 	num_accept_new = 0
-	# Update each half before using it as the complement for the next half.
-	for i_ensemble in 1:2
-		if i_ensemble == 1
-			ensemble, other = state.ensembles
-		else
-			other, ensemble = state.ensembles
-		end
-
-		for (i_chain, chain) in enumerate(ensemble.chains)
+	for (ensemble, other) in (ensembles, (ensembles[2], ensembles[1]))
+		for (i, chain) in enumerate(ensemble)
 			sample = chain.samples[end]
 
 			# Calculate jump scale
@@ -196,23 +223,23 @@ function step!(state::DifferentialEvolutionState, settings::DifferentialEvolutio
 				i_chain_other_2 = rand(1:chains_per_ensemble)
 			end
 
-			# Calculate new sample using global workspace
-			# Trying to avoid intermediate allocations
-			i_global = ensemble_to_global_index((i_ensemble, i_chain), chains_per_ensemble)
-			X1 = other.chains[i_chain_other_1].samples[end]
-			X2 = other.chains[i_chain_other_2].samples[end]
+			# Calculate new sample, avoiding intermediate allocations
+			X1 = other[i_chain_other_1].samples[end]
+			X2 = other[i_chain_other_2].samples[end]
 			for k in eachindex(sample)
-				proposals[k, i_global] = sample[k] + γ * (X2[k] - X1[k])
+				proposals[k, i] = sample[k] + γ * (X2[k] - X1[k])
+				if prior_jump_scale > 0
+					dist = state.prior_dists[k]
+					proposals[k, i] += prior_jump_scale * (rand(dist) - rand(dist))
+				end
 			end
 		end
 
-		# Evaluate only this half's proposals.
-		indices = ((i_ensemble - 1) * chains_per_ensemble + 1):(i_ensemble * chains_per_ensemble)
-		@views log_posterior_batch!(proposal_logpdfs[indices], proposals[:, indices], state.log_likelihood, state.prior_dists)
+		# Evaluate this half's proposals
+		@views log_posterior_batch!(proposal_logpdfs, proposals, state.log_likelihood, state.prior_dists)
 
 		# Accept or reject before proposing moves for the next half.
-		for (i_chain, chain) in enumerate(ensemble.chains)
-			i = ensemble_to_global_index((i_ensemble, i_chain), chains_per_ensemble)
+		for (i, chain) in enumerate(ensemble)
 			logp = proposal_logpdfs[i]
 			prev_logp = chain.logpdfs[end]
 			log_p_accept = min(0, logp - prev_logp)
@@ -233,16 +260,78 @@ function step!(state::DifferentialEvolutionState, settings::DifferentialEvolutio
 		end
 	end
 
-	# Calculate global acceptance fraction to adapt proposal scale 
-	sample_index = length(state.ensembles[1].chains[1].samples)
-	num_samples_prev = (sample_index - 1) * 2 * chains_per_ensemble
-	num_accept_prev = state.accept_frac * num_samples_prev
+	# Find chains which have gotten stuck in low-probability areas and relocate them
+	if move_outliers
+		find_outliers!(outlier_mask, state.cache.mean_logpdfs, state.chains)
+		for (i, chain) in enumerate(state.chains)
+			if !outlier_mask[i]
+				continue
+			end
+			
+			donor_ind = i
+			while outlier_mask[donor_ind]
+				donor_ind = rand(1:length(outlier_mask))
+			end
+			donor = state.chains[donor_ind]
+			chain.samples[end] = copy(donor.samples[end])
+			chain.logpdfs[end] = donor.logpdfs[end]
+			num_accept_new -= chain.accepted[end]
+			chain.accepted[end] = false
+		end
+	end
 
-	acceptance_fraction = (num_accept_prev + num_accept_new) / (sample_index * 2 * chains_per_ensemble)
+	# Adapt using only this sweep's acceptance fraction
+	acceptance_fraction = num_accept_new / (2 * chains_per_ensemble)
 	state.accept_frac = acceptance_fraction
-	state.γ0 = state.γ0 * sqrt(acceptance_fraction / settings.target_acceptance_prob)
+	accept_lo, accept_hi = (settings.target_acceptance_prob - 0.06, settings.target_acceptance_prob + 0.06)
+	if acceptance_fraction < accept_lo
+		state.γ0 *= 0.9
+	elseif acceptance_fraction > accept_hi
+		state.γ0 *= 1.1
+	else
+		state.γ0 *= sqrt(acceptance_fraction / settings.target_acceptance_prob)
+	end
 
 	return state
+end
+
+
+function find_outliers!(outlier_mask, logpdfs, chains)
+	# Find outliers using the interquartile range of the logpdf over the second half of the samples
+	steps = length(chains[1].samples)
+	window = max(1, steps ÷ 2)
+
+	# Calculate mean log-posteriors over the window
+	num_finite = 0
+	for (i, chain) in enumerate(chains)
+		sum_logpdfs = 0.0
+		sum_finite = 0
+		N = length(chain.logpdfs)
+		for j in N-window+1:N
+			if isfinite(chain.logpdfs[j])
+				sum_logpdfs += chain.logpdfs[j]
+				sum_finite += 1
+			end
+			logpdfs[i] = sum_logpdfs / sum_finite
+		end
+		num_finite += isfinite(logpdfs[i])
+	end
+
+	if num_finite == 0
+		error("All chains have non-finite scores!")
+	end
+
+	# Find IQR and cutoff
+	# Scores 2+ IQRs below the 25% quantile are considered outliers
+	q1, q3 = quantile(logpdfs, [0.25, 0.75])
+	iqr = q3 - q1
+	cutoff = q1 - 2 * iqr
+
+	for i in eachindex(chains)
+		outlier_mask[i] = (!isfinite(logpdfs[i]) || logpdfs[i] < cutoff)
+	end
+
+	return outlier_mask
 end
 
 end # module EnsembleMCMC

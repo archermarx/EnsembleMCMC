@@ -47,20 +47,29 @@ end
 	log_likelihood = x -> logpdf(likelihood, x)
 
 	chains_per_ensemble = 5
-	d, n = length(priors), 2 * chains_per_ensemble
-	ensembles = EnsembleMCMC.initialize_ensembles(chains_per_ensemble, log_likelihood, priors)
+	d, n = length(priors), chains_per_ensemble
+	chains, ensembles = EnsembleMCMC.initialize_ensemble(chains_per_ensemble, log_likelihood, priors)
 
 	@test length(ensembles) == 2
-	@test length(ensembles[1].chains) == chains_per_ensemble
-	@test length(ensembles[2].chains) == chains_per_ensemble
+	@test length(chains) == 2 * chains_per_ensemble
+	@test length(ensembles[1]) == chains_per_ensemble
+	@test length(ensembles[2]) == chains_per_ensemble
 	check_accepted = x -> length(x.accepted) == 1 && x.accepted[]
 	check_samples = x -> length(x.samples) == 1 && length(x.samples[]) == length(priors)
 	check_logpdfs = x -> length(x.logpdfs) == 1 && isfinite(x.logpdfs[])
 
 	for ensemble in ensembles
-		@test all(check_accepted, ensemble.chains)
-		@test all(check_samples, ensemble.chains)
-		@test all(check_logpdfs, ensemble.chains)
+		@test all(check_accepted, ensemble)
+		@test all(check_samples, ensemble)
+		@test all(check_logpdfs, ensemble)
+	end
+
+	# Check for pointer equality between global chain members and ensembles 
+	for (chain, ens_chain) in zip(chains[1:chains_per_ensemble], ensembles[1])
+		@test chain == ens_chain
+	end
+	for (chain, ens_chain) in zip(chains[chains_per_ensemble+1:end], ensembles[2])
+		@test chain == ens_chain
 	end
 
 	settings = EnsembleMCMC.DifferentialEvolutionSettings(;
@@ -72,26 +81,12 @@ end
 
 	@test state.cache.proposals.size == (d, n)
 	@test state.cache.proposal_logpdfs.size == (n,)
+	@test length(state.cache.ensembles) == 2
+	@test state.cache.mean_logpdfs.size == (2*n,)
+	@test state.cache.outlier_mask.size == (2*n,)
 
 	EnsembleMCMC.step!(state, settings)
 end	
-
-@testset "Ensemble vs global indexing" begin
-	chains_per_ensemble = 4
-	@test EnsembleMCMC.global_to_ensemble_index(1, chains_per_ensemble) == (1,1)
-	@test EnsembleMCMC.global_to_ensemble_index(2, chains_per_ensemble) == (1,2)
-	@test EnsembleMCMC.global_to_ensemble_index(3, chains_per_ensemble) == (1,3)
-	@test EnsembleMCMC.global_to_ensemble_index(4, chains_per_ensemble) == (1,4)
-	@test EnsembleMCMC.global_to_ensemble_index(5, chains_per_ensemble) == (2,1)
-	@test EnsembleMCMC.global_to_ensemble_index(6, chains_per_ensemble) == (2,2)
-	@test EnsembleMCMC.global_to_ensemble_index(7, chains_per_ensemble) == (2,3)
-	@test EnsembleMCMC.global_to_ensemble_index(8, chains_per_ensemble) == (2,4)
-
-	for i in 1:8
-		ensemble_idx = EnsembleMCMC.global_to_ensemble_index(i, chains_per_ensemble)
-		@test EnsembleMCMC.ensemble_to_global_index(ensemble_idx, chains_per_ensemble) == i
-	end	
-end
 
 @testset "Linear regression" begin
 	N = 100
@@ -119,12 +114,38 @@ end
 
 	state = EnsembleMCMC.initialize_sampler(settings, log_likelihood, priors)
 
+	# warmup run
 	num_samples = 500
-	for _ in 1:num_samples
-		EnsembleMCMC.step!(state, settings)
+	for i in 1:num_samples
+		EnsembleMCMC.step!(state, settings, move_outliers=(i % 100 == 0))
 	end
 
-	p_accept = EnsembleMCMC.calc_acceptance_fraction(state.ensembles)
+	for chain in state.chains
+		@test length(chain.samples) == num_samples + 1
+		@test length(chain.logpdfs) == num_samples + 1
+		@test length(chain.accepted) == num_samples + 1
+	end
+
+	last_samples = [c.samples[end] for c in state.chains]
+	last_logpdfs = [c.logpdfs[end] for c in state.chains]
+
+	EnsembleMCMC.clear_history!(state)
+
+	for (i, chain) in enumerate(state.chains)
+		@test length(chain.samples) == 1
+		@test length(chain.logpdfs) == 1
+		@test length(chain.accepted) == 1
+		@test all(chain.samples[] .== last_samples[i])
+		@test chain.logpdfs[] == last_logpdfs[i]
+		@test chain.accepted[] == true
+	end
+
+	# proper sampling run
+	for i in 1:num_samples
+		EnsembleMCMC.step!(state, settings, move_outliers=false)
+	end
+
+	p_accept = EnsembleMCMC.calc_acceptance_fraction(state.chains)
 	@test 0.2 <= p_accept <= 0.3
 
 	line = "-" ^ 34
@@ -138,20 +159,18 @@ end
 	frac_burn = 0.25
 	num_burn = floor(Int, num_samples * frac_burn)
 	global_ind = 0
-	for e in state.ensembles
-		for c in e.chains
-			for (i, (sample, logp)) in enumerate(zip(c.samples, c.logpdfs))
-				if i <= num_burn
-					continue
-				end
-				global_ind += 1
-				if logp > best_logp
-					best_logp = logp
-					best_sample = global_ind
-				end
-				push!(samples, sample)
-				push!(logpdfs, logp)
+	for c in state.chains
+		for (i, (sample, logp)) in enumerate(zip(c.samples, c.logpdfs))
+			if i <= num_burn
+				continue
 			end
+			global_ind += 1
+			if logp > best_logp
+				best_logp = logp
+				best_sample = global_ind
+			end
+			push!(samples, sample)
+			push!(logpdfs, logp)
 		end
 	end
 
@@ -206,5 +225,5 @@ end
 		mk.lines!(x, q_hi, color=:black, linestyle=:dash)
 		mk.save("samples_linear.png", fig, dpi=200)
 	end
-
 end
+
