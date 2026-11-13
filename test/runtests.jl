@@ -3,6 +3,7 @@ using Test
 using Distributions
 using LinearAlgebra
 using Printf
+using Random
 using CairoMakie: Makie as mk
 
 @testset "Log-pdf evaluation" begin
@@ -92,6 +93,43 @@ end
 
 	EnsembleMCMC.step!(state, settings)
 end	
+
+@testset "DREAM crossover" begin
+	Random.seed!(31415)
+	mask = zeros(Bool, 8)
+	@test EnsembleMCMC.sample_crossover!(mask, 0.0) == 1
+	@test count(mask) == 1
+	@test EnsembleMCMC.sample_crossover!(mask, 1.0) == length(mask)
+	@test all(mask)
+	EnsembleMCMC.sample_crossover!(mask, 1/3) # Compile before measuring scratch allocations.
+	@test (@allocated EnsembleMCMC.sample_crossover!(mask, 1/3)) == 0
+
+	# A flat target accepts every proposal, exposing which coordinates were updated.
+	priors = fill(Uniform(-1e6, 1e6), length(mask))
+	for (num_crossover_values, prior_jump_scale) in ((1, 0.0), (3, 0.0), (3, 1e-6))
+		settings = EnsembleMCMC.DifferentialEvolutionSettings(;
+			chains_per_ensemble=4, target_acceptance_prob=0.25,
+			stretch_parameter=0.0, prior_jump_scale, num_crossover_values
+		)
+		state = EnsembleMCMC.initialize_sampler(settings, x -> (0.0, nothing), priors)
+		state.γ0 = 0.01
+		for (i, chain) in enumerate(state.chains)
+			fill!(chain.samples[end], 10.0 * i)
+		end
+		EnsembleMCMC.step!(state, settings)
+		saw_partial = false
+		for chain in state.chains
+			num_changed = count(k -> chain.samples[end][k] != chain.samples[1][k], eachindex(mask))
+			@test chain.accepted[end]
+			@test 1 <= num_changed <= length(mask)
+			if num_crossover_values == 1
+				@test num_changed == length(mask)
+			end
+			saw_partial |= num_changed < length(mask)
+		end
+		@test saw_partial == (num_crossover_values > 1)
+	end
+end
 
 @testset "Linear regression" begin
 	N = 100

@@ -10,6 +10,7 @@ using Printf
 	target_acceptance_prob::Float64
 	stretch_parameter::Float64
 	prior_jump_scale::Float64 = 0.0 # Scale of the difference of two independent prior draws.
+	num_crossover_values::Int = 3 # CR = 1/n, ..., 1; set to 1 for full-vector updates.
 end
 
 struct Chain
@@ -31,6 +32,7 @@ struct SamplerCache
 	outlier_mask::Vector{Bool}
 	mean_logpdfs::Vector{Float64}
 	cached_evals::Vector{Any}
+	crossover_mask::Vector{Bool}
 end
 
 mutable struct DifferentialEvolutionState{F, D}
@@ -143,6 +145,24 @@ function calc_γ0(d)
 	return 2.38 / sqrt(2 * d)
 end
 
+function sample_crossover!(mask, probability)
+	if probability == 1
+		fill!(mask, true)
+		return length(mask)
+	end
+
+	num_active = 0
+	for k in eachindex(mask)
+		mask[k] = rand() < probability
+		num_active += mask[k]
+	end
+	if num_active == 0
+		mask[rand(eachindex(mask))] = true
+		num_active = 1
+	end
+	return num_active
+end
+
 function initialize_sampler(
 	settings::DifferentialEvolutionSettings,
 	log_likelihood,
@@ -153,6 +173,7 @@ function initialize_sampler(
 	if !isfinite(settings.prior_jump_scale) || settings.prior_jump_scale < 0
 		throw(ArgumentError("prior_jump_scale must be finite and nonnegative"))
 	end
+	settings.num_crossover_values >= 1 || throw(ArgumentError("num_crossover_values must be positive"))
 
 	# Initialize ensembles, sampling from the prior distributions
 	chains, ensembles = initialize_ensemble(settings.chains_per_ensemble, log_likelihood, prior_dists; initial_sample, initial_sample_spread)
@@ -160,7 +181,7 @@ function initialize_sampler(
 	# Prepare sampler state and caches
 	d, n = length(prior_dists), settings.chains_per_ensemble
 	cached_evals = Array{Any, 1}(undef, n)
-	cache = SamplerCache(copy(chains), ensembles, zeros(d, n), zeros(n), zeros(Bool, 2*n), zeros(2 * n), cached_evals)
+	cache = SamplerCache(copy(chains), ensembles, zeros(d, n), zeros(n), zeros(Bool, 2*n), zeros(2 * n), cached_evals, zeros(Bool, d))
 	state = DifferentialEvolutionState(log_likelihood, prior_dists, calc_γ0(d), 1.0, chains, cache)
 	return state
 end
@@ -197,15 +218,10 @@ end
 
 """
     step!(state, settings; move_outliers=false)
-
-Advance all chains once. Optionally replace low-density outliers with copies of
-random surviving walkers, using the most recent half of the recorded proposals.
-Relocations are not counted as accepted Metropolis proposals. Enable relocation
-only for samples the caller intends to discard.
 """
 function step!(state::DifferentialEvolutionState, settings::DifferentialEvolutionSettings; move_outliers::Bool=false)
-	(;outlier_mask, chain_cache, cached_evals, ensembles, proposals, proposal_logpdfs) = state.cache
-	(;chains_per_ensemble, stretch_parameter, prior_jump_scale) = settings
+	(;outlier_mask, chain_cache, cached_evals, ensembles, proposals, proposal_logpdfs, crossover_mask) = state.cache
+	(;chains_per_ensemble, stretch_parameter, prior_jump_scale, num_crossover_values) = settings
 
 	# Reshuffle whole chains between halves, preserving their histories.
 	copyto!(chain_cache, state.chains)
@@ -219,9 +235,13 @@ function step!(state::DifferentialEvolutionState, settings::DifferentialEvolutio
 		for (i, chain) in enumerate(ensemble)
 			sample = chain.samples[end]
 
+			# DREAM crossover: choose a probability, then a nonempty coordinate subset.
+			probability = num_crossover_values == 1 ? 1.0 : rand(1:num_crossover_values) / num_crossover_values
+			num_active = sample_crossover!(crossover_mask, probability)
+
 			# Calculate jump scale
 			z = randn() * stretch_parameter
-			γ = state.γ0 * (1 + z)
+			γ = state.γ0 * sqrt(length(sample) / num_active) * (1 + z)
 
 			# Draw two samples from the other ensemble, without replacement
 			# TODO: probably a better way to do this than rejection sampling?
@@ -235,10 +255,14 @@ function step!(state::DifferentialEvolutionState, settings::DifferentialEvolutio
 			X1 = other[i_chain_other_1].samples[end]
 			X2 = other[i_chain_other_2].samples[end]
 			for k in eachindex(sample)
+				if !crossover_mask[k]
+					proposals[k, i] = sample[k]
+					continue
+				end
 				proposals[k, i] = sample[k] + γ * (X2[k] - X1[k])
 				if prior_jump_scale > 0
 					dist = state.prior_dists[k]
-					proposals[k, i] += prior_jump_scale * (rand(dist) - rand(dist))
+					proposals[k, i] += prior_jump_scale * γ * (rand(dist) - rand(dist))
 				end
 			end
 		end
