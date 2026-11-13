@@ -8,26 +8,28 @@ using CairoMakie: Makie as mk
 @testset "Log-pdf evaluation" begin
 	priors = [Normal(0,1), Normal(0,1)]
 	likelihood = MvNormal([0.0, 0.0], LinearAlgebra.Diagonal([1.0, 1.0]))
-	log_likelihood = x -> logpdf(likelihood, x)
+	log_likelihood = x -> (logpdf(likelihood, x), x)
 
 	sample = [0.0, 0.0]
 
-	logp_calc = EnsembleMCMC.log_posterior(sample, log_likelihood, priors)
+	logp_calc, model_eval = EnsembleMCMC.log_posterior(sample, log_likelihood, priors)
 	logp_exp = 4 * logpdf(Normal(0,1), 0.0)
 	@test logp_calc ≈ logp_exp
+	@test model_eval == sample
 
 	priors = [Uniform(-1,1), Uniform(-1,1)]
-	logp_calc = EnsembleMCMC.log_posterior(sample, log_likelihood, priors)
+	logp_calc, model_eval = EnsembleMCMC.log_posterior(sample, log_likelihood, priors)
 	@test logp_calc ≈ 2 * logpdf(Normal(0,1), 0.0) + 2 * logpdf(Uniform(-1, 1), 0.0)
+	@test model_eval == sample
 
 	samples = [[0.5, 0.0], [0.0, 0.5]]
-	logp_calc = EnsembleMCMC.log_posterior_batch(samples, log_likelihood, priors)
+	logp_calc = EnsembleMCMC.log_posterior_batch(samples, log_likelihood, priors)[1]
 	for (i, s) in enumerate(samples)
-		@test logp_calc[i] ≈ EnsembleMCMC.log_posterior(s, log_likelihood, priors)
+		@test logp_calc[i] ≈ EnsembleMCMC.log_posterior(s, log_likelihood, priors)[1]
 	end
 
 	samples_matrix = hcat(samples...)
-	logp_calc_matrix = EnsembleMCMC.log_posterior_batch(samples_matrix, log_likelihood, priors)
+	logp_calc_matrix, _ = EnsembleMCMC.log_posterior_batch(samples_matrix, log_likelihood, priors)
 	@test all(logp_calc .≈ logp_calc_matrix)
 end
 
@@ -44,7 +46,7 @@ end
 @testset "Initialization" begin
 	priors = [Uniform(0,1), Uniform(0,1), Uniform(0,1)]
 	likelihood = MvNormal([0.5, 0.5, 0.5], LinearAlgebra.Diagonal([1.0, 1.0, 1.0]))
-	log_likelihood = x -> logpdf(likelihood, x)
+	log_likelihood = x -> (logpdf(likelihood, x), 0.0)
 
 	chains_per_ensemble = 5
 	d, n = length(priors), chains_per_ensemble
@@ -57,11 +59,13 @@ end
 	check_accepted = x -> length(x.accepted) == 1 && x.accepted[]
 	check_samples = x -> length(x.samples) == 1 && length(x.samples[]) == length(priors)
 	check_logpdfs = x -> length(x.logpdfs) == 1 && isfinite(x.logpdfs[])
+	check_model_evals = x -> length(x.model_evals) == 1 && x.model_evals[] == 0.0
 
 	for ensemble in ensembles
 		@test all(check_accepted, ensemble)
 		@test all(check_samples, ensemble)
 		@test all(check_logpdfs, ensemble)
+		@test all(check_model_evals, ensemble)
 	end
 
 	# Check for pointer equality between global chain members and ensembles 
@@ -84,6 +88,7 @@ end
 	@test length(state.cache.ensembles) == 2
 	@test state.cache.mean_logpdfs.size == (2*n,)
 	@test state.cache.outlier_mask.size == (2*n,)
+	@test state.cache.cached_evals.size == (n,)
 
 	EnsembleMCMC.step!(state, settings)
 end	
@@ -101,7 +106,7 @@ end
 
 	function log_likelihood(p)	
 		y_calc = f(x, p)
-		return logpdf(distribution, y_calc)
+		return logpdf(distribution, y_calc), y_calc
 	end
 
 	priors = [Uniform(-2, 2), Uniform(-2, 2)]

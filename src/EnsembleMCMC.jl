@@ -3,6 +3,7 @@ module EnsembleMCMC
 using Distributions: logpdf
 using Random: shuffle!
 using Statistics: mean, quantile
+using Printf
 
 @kwdef struct DifferentialEvolutionSettings
 	chains_per_ensemble::Int
@@ -15,6 +16,7 @@ struct Chain
 	samples::Vector{Vector{Float64}}
 	logpdfs::Vector{Float64}
 	accepted::Vector{Bool}
+	model_evals::Vector{Any}
 end
 
 struct Ensemble
@@ -28,6 +30,7 @@ struct SamplerCache
 	proposal_logpdfs::Vector{Float64}
 	outlier_mask::Vector{Bool}
 	mean_logpdfs::Vector{Float64}
+	cached_evals::Vector{Any}
 end
 
 mutable struct DifferentialEvolutionState{F, D}
@@ -47,47 +50,49 @@ function log_posterior(sample, log_likelihood, prior_dists)
 	end
 
 	if !isfinite(logp)
-		return -Inf
+		return -Inf, nothing
 	end
 
-	logp += log_likelihood(sample)
+	logL, model_eval = log_likelihood(sample)
+	logp += logL
 
-	return logp
+	return logp, model_eval
 end
-
 
 """
 Evaluates batched log posterior distribution when samples are in a vector of vectors
 """
-function log_posterior_batch!(logps, samples::Vector, log_likelihood, prior_dists)
+function log_posterior_batch!(logps, model_evals, samples::Vector, log_likelihood, prior_dists)
 	Threads.@threads for i in eachindex(samples)
-		logps[i] = log_posterior(samples[i], log_likelihood, prior_dists)
+		logps[i], model_evals[i] = log_posterior(samples[i], log_likelihood, prior_dists)
 	end
 
-	return logps
+	return logps, model_evals
 end
 
 """
 Evaluates batched log posterior distribution when samples are in a matrix of (d, num_samples)
 """
-function log_posterior_batch!(logps, samples::AbstractMatrix, log_likelihood, prior_dists)
+function log_posterior_batch!(logps, model_evals, samples::AbstractMatrix, log_likelihood, prior_dists)
 	Threads.@threads for i in axes(samples, 2)
-		logps[i] = log_posterior(@views(samples[:, i]), log_likelihood, prior_dists)
+		logps[i], model_evals[i] = log_posterior(@views(samples[:, i]), log_likelihood, prior_dists)
 	end
 
-	return logps
+	return logps, model_evals
 end
 
 function log_posterior_batch(samples::Matrix, log_likelihood, prior_dists)
 	(dim, num_samples) = samples.size
 	logps = zeros(num_samples)
-	return log_posterior_batch!(logps, samples, log_likelihood, prior_dists)
+	model_evals = Array{Any, 1}(undef, num_samples)
+	return log_posterior_batch!(logps, model_evals, samples, log_likelihood, prior_dists)
 end
 
 function log_posterior_batch(samples::Vector, log_likelihood, prior_dists)
 	num_samples = length(samples)
 	logps = zeros(num_samples)
-	return log_posterior_batch!(logps, samples, log_likelihood, prior_dists)
+	model_evals = Array{Any, 1}(undef, num_samples)
+	return log_posterior_batch!(logps, model_evals, samples, log_likelihood, prior_dists)
 end
 
 function sample_distributions(dists, num_samples)
@@ -123,10 +128,10 @@ function initialize_ensemble(
 		end
 	end
 
-	logpdfs = log_posterior_batch(samples, log_likelihood, prior_dists)
+	logpdfs, model_evals = log_posterior_batch(samples, log_likelihood, prior_dists)
 
 	chains = [
-		Chain([samples[:, i]], [logpdfs[i]], [true]) for i in eachindex(logpdfs)
+		Chain([samples[:, i]], [logpdfs[i]], [true], [model_evals[i]]) for i in eachindex(logpdfs)
 	]
 
 	ensemble_1 = chains[1:chains_per_ensemble]
@@ -154,7 +159,8 @@ function initialize_sampler(
 
 	# Prepare sampler state and caches
 	d, n = length(prior_dists), settings.chains_per_ensemble
-	cache = SamplerCache(copy(chains), ensembles, zeros(d, n), zeros(n), zeros(Bool, 2*n), zeros(2 * n))
+	cached_evals = Array{Any, 1}(undef, n)
+	cache = SamplerCache(copy(chains), ensembles, zeros(d, n), zeros(n), zeros(Bool, 2*n), zeros(2 * n), cached_evals)
 	state = DifferentialEvolutionState(log_likelihood, prior_dists, calc_γ0(d), 1.0, chains, cache)
 	return state
 end
@@ -178,11 +184,13 @@ function clear_history!(state)
 		chain.samples[1] = chain.samples[end]
 		chain.logpdfs[1] = chain.logpdfs[end]
 		chain.accepted[1] = true
+		chain.model_evals[1] = true
 
 		# We do a resize-in-place to avoid invalidating pointers
 		resize!(chain.samples, 1)
 		resize!(chain.logpdfs, 1)
 		resize!(chain.accepted, 1)
+		resize!(chain.model_evals, 1)
 	end
 	return state
 end
@@ -196,7 +204,7 @@ Relocations are not counted as accepted Metropolis proposals. Enable relocation
 only for samples the caller intends to discard.
 """
 function step!(state::DifferentialEvolutionState, settings::DifferentialEvolutionSettings; move_outliers::Bool=false)
-	(;outlier_mask, chain_cache, ensembles, proposals, proposal_logpdfs) = state.cache
+	(;outlier_mask, chain_cache, cached_evals, ensembles, proposals, proposal_logpdfs) = state.cache
 	(;chains_per_ensemble, stretch_parameter, prior_jump_scale) = settings
 
 	# Reshuffle whole chains between halves, preserving their histories.
@@ -236,7 +244,7 @@ function step!(state::DifferentialEvolutionState, settings::DifferentialEvolutio
 		end
 
 		# Evaluate this half's proposals
-		@views log_posterior_batch!(proposal_logpdfs, proposals, state.log_likelihood, state.prior_dists)
+		log_posterior_batch!(proposal_logpdfs, cached_evals, proposals, state.log_likelihood, state.prior_dists)
 
 		# Accept or reject before proposing moves for the next half.
 		for (i, chain) in enumerate(ensemble)
@@ -250,12 +258,14 @@ function step!(state::DifferentialEvolutionState, settings::DifferentialEvolutio
 				push!(chain.samples, proposals[:, i])
 				push!(chain.logpdfs, logp)
 				push!(chain.accepted, true)
+				push!(chain.model_evals, cached_evals[i])
 				num_accept_new += 1
 			else
 				# reject
 				push!(chain.samples, copy(chain.samples[end]))
 				push!(chain.logpdfs, prev_logp)
 				push!(chain.accepted, false)
+				push!(chain.model_evals, chain.model_evals[end])
 			end
 		end
 	end
@@ -263,11 +273,12 @@ function step!(state::DifferentialEvolutionState, settings::DifferentialEvolutio
 	# Find chains which have gotten stuck in low-probability areas and relocate them
 	if move_outliers
 		find_outliers!(outlier_mask, state.cache.mean_logpdfs, state.chains)
+		num_outliers = 0
 		for (i, chain) in enumerate(state.chains)
 			if !outlier_mask[i]
 				continue
 			end
-			
+			num_outliers += 1	
 			donor_ind = i
 			while outlier_mask[donor_ind]
 				donor_ind = rand(1:length(outlier_mask))
@@ -277,6 +288,10 @@ function step!(state::DifferentialEvolutionState, settings::DifferentialEvolutio
 			chain.logpdfs[end] = donor.logpdfs[end]
 			num_accept_new -= chain.accepted[end]
 			chain.accepted[end] = false
+			chain.model_evals[end] = donor.model_evals[end]
+		end
+		if num_outliers > 0
+			@printf("%d outliers moved\n", num_outliers)
 		end
 	end
 
